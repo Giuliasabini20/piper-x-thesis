@@ -46,15 +46,20 @@ for i = 1:4
 end
 
 % ------------------------------
-% Uso dell'inverseKinematics al posto di generalizedInverseKinematics
+% Uso di generalizedInverseKinematics con vincoli sui limiti dei giunti
 % ------------------------------
-% Crea il solver di cinematica inversa standard
-ik = inverseKinematics("RigidBodyTree", robot);
+% Crea il solver di cinematica inversa generalizzata
+gik = generalizedInverseKinematics( ...
+    "RigidBodyTree", robot, ...
+    "ConstraintInputs", {"pose", "joint"});
 
-% Peso per la risoluzione: [x y z roll pitch yaw] (modifica se necessario)
-weights = [0.25 0.25 0.25 1 1 1];
+% Crea il vincolo sulla posa della pinza.
+poseConstraint = constraintPoseTarget(ee);
 
-% Configurazione iniziale del robot (come struct o vettore, OK per inverseKinematics)
+% Crea il vincolo sui limiti dei giunti.
+jointConstraint = constraintJointBounds(robot);
+
+% Configurazione iniziale del robot.
 q0 = homeConfiguration(robot);
 
 % Numero di pose da raggiungere.
@@ -63,89 +68,41 @@ numPoses = 4;
 % Numero di giunti rappresentati nella configurazione.
 numJoints = numel(q0);
 
-% Prealloca la matrice delle configurazioni (riga per ogni posa)
+% Prealloca la matrice delle configurazioni.
 Q = zeros(numPoses, numJoints);
 
 % Memorizza le informazioni sul risultato del solver.
 solInfoAll = cell(numPoses, 1);
 
-% Funzione di supporto inline per convertire la soluzione in riga numerica
-convertToRow = @(q) (isstruct(q) * 0); % placeholder per compatibilità; sovrascritto sotto
-
-% Definisce convertToRow correttamente (cioè non usare function file separato)
-if isstruct(q0)
-    convertToRow = @(q) arrayfun(@(s)s.JointPosition, q);
-else
-    convertToRow = @(q) q;
-end
-
-% Calcola una configurazione per ciascuna posa con inverseKinematics
+% Calcola una configurazione per ciascuna posa.
 for i = 1:numPoses
 
-    targetPose = Ttarget(:,:,i);
+    % Aggiorna la posa desiderata della pinza.
+    poseConstraint.TargetTransform = Ttarget(:,:,i);
 
-    % Risolvi la cinematica inversa
-    % Restituisce qSol (struct array o vettore) e solInfo (info diagnostico)
-    [qSol, solInfo] = ik(ee, targetPose, weights, q0);
+    % Risolvi la cinematica inversa con vincoli di giunto.
+    [qSol, solInfo] = gik(q0, poseConstraint, jointConstraint);
 
-    % Converti la soluzione in riga numerica, compatibile con Q
-    try
-        qRow = convertToRow(qSol);
-    catch
-        % Se qualcosa va storto con la conversione, prova ad estrarre manualmente
-        if isstruct(qSol)
-            qRow = zeros(1, numJoints);
-            for k = 1:numel(qSol)
-                if isfield(qSol(k), "JointPosition")
-                    qRow(k) = qSol(k).JointPosition;
-                else
-                    qRow(k) = qSol(k);
-                end
-            end
-        else
-            qRow = qSol;
+    % Controlla se il solver ha trovato una soluzione entro le tolleranze definite.
+    if isstruct(solInfo) && isfield(solInfo, "Status")
+        if ~strcmp(solInfo.Status, "success")
+            error("Soluzione non verificata per la posa %d. Stato: %s", i, solInfo.Status);
+        end
+    elseif isfield(solInfo, "ExitFlag")
+        if solInfo.ExitFlag <= 0
+            error("Soluzione non verificata per la posa %d. ExitFlag: %d", i, solInfo.ExitFlag);
         end
     end
 
-    % Controllo basilare sul risultato: solInfo può avere campi diversi a seconda della versione
-    success = true;
-    if isstruct(solInfo)
-        if isfield(solInfo, "Status")
-            success = strcmpi(solInfo.Status, "success");
-        elseif isfield(solInfo, "ExitFlag")
-            success = solInfo.ExitFlag > 0;
-        end
-        % Altre versioni di MATLAB potrebbero restituire campi diversi; non tutte forniscono "Status".
-    end
+    % Salva la configurazione nella riga corrispondente.
+    Q(i,:) = qSol;
 
-    if ~success
-        warning("Il solver inverseKinematics potrebbe non aver trovato una soluzione pienamente verificata per la posa %d. Controlla solInfoAll{%d}.", i, i);
-        % Se preferisci terminare con errore, usa: error(...)
-    end
-
-    % Salva la configurazione numerica
-    Q(i, :) = qRow;
-
-    % Salva le informazioni del calcolo
+    % Salva le informazioni del calcolo.
     solInfoAll{i} = solInfo;
 
     % Usa la soluzione come punto iniziale successivo.
-    % Per inverseKinematics l'initial guess può essere fornito come struct o vettore.
-    if isstruct(qSol)
-        q0 = qSol;
-    else
-        % Se qSol è vettore e robot.DataFormat="row", crea struct initial guess
-        if isrow(qSol)
-            % costruiamo un struct compatibile
-            qStruct = homeConfiguration(robot);
-            for k = 1:numel(qStruct)
-                qStruct(k).JointPosition = qSol(k);
-            end
-            q0 = qStruct;
-        else
-            q0 = qSol;
-        end
-    end
+    q0 = qSol;
+
 end
 
 % Visualizza la matrice finale.
