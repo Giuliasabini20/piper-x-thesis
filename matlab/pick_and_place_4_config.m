@@ -1,57 +1,96 @@
+% pick_and_place_4_config.m
+% Versione estesa: usa generalizedInverseKinematics con vincoli sui limiti dei giunti,
+% include debug, controllo automatico delle pose e possibilità di impostare
+% algoritmo e parametri del solver.
+
 clear;
 clc;
 close all;
 
-% Importa il robot (sostituire con il percorso reale del file URDF)
+%% NOTE PRE-ESECUZIONE (consigliate da eseguire con Python/ROS/SDK)
+% Esegui questi controlli prima di muovere fisicamente il robot:
+% 1) ping all'indirizzo del controller del robot
+% 2) verifica che ROS/daemon sia in esecuzione (es. /joint_states attivo)
+% 3) controlla che non ci siano fault (topic /diagnostics o API dedicata)
+% 4) esegui un 'soft move' di test molto piccolo e controlla risposta in joint_states
+% (Per snippet Python/ROS2 vedi le istruzioni fornite separatamente)
+
+%% Parametri di controllo e debug
+verbose = true;
+translation_tol = 5e-3;    % [m] tolleranza di posizione
+rotation_tol = deg2rad(2); % [rad] tolleranza orientamento
+maxRetries = 5;            % quante volte ritentare con jitter
+jitterScale = 0.02;        % scala del jitter in radianti (per retry)
+logCSVname = "diagnostic_pose_log.csv";
+
+%% Importa robot
 robot = importrobot("PERCORSO_DEL_TUO_FILE.urdf");
 robot.DataFormat = "row";
 
-% Configurazione iniziale
-config = homeConfiguration(robot);
+% Configurazione iniziale (home)
+q0 = homeConfiguration(robot);
 
 showdetails(robot);
-
 figure;
-show(robot, config);
+show(robot, q0);
 title("Robot nella configurazione iniziale");
-robot.BodyNames
 
-% Nome reale del frame dell'ee (pinza) da sostituire
+% Nome reale dell'end-effector (sostituisci con il nome reale)
 ee = "NOME_REALE_DEL_FRAME_DELLA_PINZA";
 
-% Coordinate illustrative: sostituirle con quelle reali.
-% Unità: metri.
+% Punti target (m) e orientazioni (eul ZYX)
 P = [
-    0.30  0.10  0.25;  % 1. Avvicinamento all'oggetto
-    0.30  0.10  0.15;  % 2. Presa dell'oggetto
-    0.45  0.20  0.25;  % 3. Trasferimento sopra la destinazione
-    0.45  0.20  0.15   % 4. Deposito
+    0.30  0.10  0.25;
+    0.30  0.10  0.15;
+    0.45  0.20  0.25;
+    0.45  0.20  0.15
     ];
-
-% Orientamenti illustrative, in radianti.
-% Ogni riga contiene [yaw pitch roll] per la convenzione ZYX.
 EUL = [
-    0  pi  0;  % 1. Orientamento di avvicinamento
-    0  pi  0;  % 2. Orientamento per la presa
-    0  pi  0;  % 3. Orientamento durante il trasferimento
-    0  pi  0   % 4. Orientamento per il deposito
+    0  pi  0;
+    0  pi  0;
+    0  pi  0;
+    0  pi  0
     ];
 
-% Crea le quattro matrici di trasformazione 4x4.
-Ttarget = zeros(4, 4, 4);
-for i = 1:4
+numPoses = size(P,1);
+
+% Crea le trasformazioni target
+Ttarget = zeros(4,4,numPoses);
+for i = 1:numPoses
     Tpos = trvec2tform(P(i,:));
     Trot = eul2tform(EUL(i,:), "ZYX");
     Ttarget(:,:,i) = Tpos * Trot;
 end
 
 % ------------------------------
-% Uso di generalizedInverseKinematics con vincoli sui limiti dei giunti
+% Setup generalizedInverseKinematics e vincoli
 % ------------------------------
 % Crea il solver di cinematica inversa generalizzata
 gik = generalizedInverseKinematics( ...
     "RigidBodyTree", robot, ...
     "ConstraintInputs", {"pose", "joint"});
+
+% ----- Impostazione dell'algoritmo e dei parametri del solver (opzionale) -----
+% Nota: non tutte le versioni della toolbox espongono tutte le opzioni; racchiudi in try/catch per compatibilità.
+try
+    % Scegli l'algoritmo solver: esempio "BFGSGradientProjection"
+    gik.SolverAlgorithm = "BFGSGradientProjection";
+
+    % Modifica i parametri del solver
+    params = gik.SolverParameters;
+    params.MaxIterations      = 1500;    % massimo numero di iterazioni
+    params.SolutionTolerance  = 1e-6;    % tolleranza sulla soluzione
+    params.GradientTolerance  = 1e-8;    % tolleranza sul gradiente
+    params.MaxTime            = 10;      % tempo massimo per chiamata (s)
+    gik.SolverParameters = params;
+    if verbose
+        disp("SolverAlgorithm impostato a: " + gik.SolverAlgorithm);
+        disp(params);
+    end
+catch ME
+    warning("Impostazione algoritmo/parametri del solver non supportata: %s", ME.message);
+end
+% ---------------------------------------------------------------------------
 
 % Crea il vincolo sulla posa della pinza.
 poseConstraint = constraintPoseTarget(ee);
@@ -59,67 +98,192 @@ poseConstraint = constraintPoseTarget(ee);
 % Crea il vincolo sui limiti dei giunti.
 jointConstraint = constraintJointBounds(robot);
 
-% Configurazione iniziale del robot.
-q0 = homeConfiguration(robot);
+% (Opzionale) Imposta una initial guess esplicita come struct
+initialGuess = homeConfiguration(robot);
 
-% Numero di pose da raggiungere.
-numPoses = 4;
+% Esempio di chiamata singola al solver con visualizzazione del risultato (test)
+try
+    % usa la prima target come test (non altera il ciclo principale)
+    poseConstraint.TargetTransform = Ttarget(:,:,1);
+    [qSolTest, solInfoTest] = gik(initialGuess, poseConstraint, jointConstraint);
 
-% Numero di giunti rappresentati nella configurazione.
-numJoints = numel(q0);
+    disp("Configurazione dei giunti trovata (test):");
+    disp(qSolTest);
 
-% Prealloca la matrice delle configurazioni.
-Q = zeros(numPoses, numJoints);
-
-% Memorizza le informazioni sul risultato del solver.
-solInfoAll = cell(numPoses, 1);
-
-% Calcola una configurazione per ciascuna posa.
-for i = 1:numPoses
-
-    % Aggiorna la posa desiderata della pinza.
-    poseConstraint.TargetTransform = Ttarget(:,:,i);
-
-    % Risolvi la cinematica inversa con vincoli di giunto.
-    [qSol, solInfo] = gik(q0, poseConstraint, jointConstraint);
-
-    % Controlla se il solver ha trovato una soluzione entro le tolleranze definite.
-    if isstruct(solInfo) && isfield(solInfo, "Status")
-        if ~strcmp(solInfo.Status, "success")
-            error("Soluzione non verificata per la posa %d. Stato: %s", i, solInfo.Status);
-        end
-    elseif isfield(solInfo, "ExitFlag")
-        if solInfo.ExitFlag <= 0
-            error("Soluzione non verificata per la posa %d. ExitFlag: %d", i, solInfo.ExitFlag);
-        end
+    if isstruct(solInfoTest) && isfield(solInfoTest, "Status")
+        disp("Stato del solver (test):");
+        disp(solInfoTest.Status);
+    elseif isfield(solInfoTest, "ExitFlag")
+        disp("ExitFlag (test):");
+        disp(solInfoTest.ExitFlag);
     end
 
-    % Salva la configurazione nella riga corrispondente.
-    Q(i,:) = qSol;
+    if isstruct(solInfoTest) && isfield(solInfoTest, "PoseErrorNorm")
+        disp("Errore della posa (norm) (test):");
+        disp(solInfoTest.PoseErrorNorm);
+    end
 
-    % Salva le informazioni del calcolo.
-    solInfoAll{i} = solInfo;
-
-    % Usa la soluzione come punto iniziale successivo.
-    q0 = qSol;
-
+    % Visualizza la configurazione trovata
+    figure;
+    show(robot, qSolTest);
+    title("Soluzione Generalized Inverse Kinematics (test)");
+catch ME
+    warning("Chiamata di test al solver fallita: %s", ME.message);
 end
 
-% Visualizza la matrice finale.
+% Estrai limiti dei giunti (ordine non-fixed bodies)
+[lowerLimits, upperLimits] = getJointLimits(robot);
+numJoints = numel(lowerLimits);
+
+% Preallocazioni
+Q = zeros(numPoses, numJoints);
+solInfoAll = cell(numPoses,1);
+diagRows = []; % per CSV: poseIndex, success, t_err, r_err_deg, attempts
+
+% Ciclo sulle pose con retry e verifica
+q0 = initialGuess; % start guess
+for i = 1:numPoses
+    target = Ttarget(:,:,i);
+    poseConstraint.TargetTransform = target;
+    successFlag = false;
+    attempts = 0;
+    lastSol = zeros(1,numJoints);
+    lastSolInfo = [];
+
+    while ~successFlag && attempts < maxRetries
+        attempts = attempts + 1;
+        if verbose
+            fprintf("Pose %d: attempt %d\n", i, attempts);
+        end
+
+        % risolvi
+        [qSol, solInfo] = gik(q0, poseConstraint, jointConstraint);
+
+        % converti qSol in vettore riga (se è struct)
+        if isstruct(qSol)
+            qVec = arrayfun(@(s)s.JointPosition, qSol);
+        else
+            qVec = qSol;
+        end
+
+        % controlla limiti (doppio controllo)
+        outOfBounds = any(qVec < lowerLimits - 1e-12) || any(qVec > upperLimits + 1e-12);
+
+        % calcola T attuale e errori
+        try
+            Tact = getTransform(robot, qVec, ee);
+        catch ME
+            Tact = eye(4);
+            warning("Impossibile calcolare getTransform: %s", ME.message);
+        end
+        [t_err, r_err] = poseError(Tact, target);
+
+        % decide successo: solInfo + soglie errori + limiti
+        okSolver = true;
+        if isstruct(solInfo) && isfield(solInfo,"Status")
+            okSolver = strcmp(solInfo.Status,"success");
+        elseif isfield(solInfo,"ExitFlag")
+            okSolver = solInfo.ExitFlag > 0;
+        end
+
+        if okSolver && ~outOfBounds && t_err <= translation_tol && r_err <= rotation_tol
+            % accettata
+            successFlag = true;
+            lastSol = qVec;
+            lastSolInfo = solInfo;
+            if verbose
+                fprintf("Pose %d OK (t_err=%.4fm r_err=%.3fdeg)\n", i, t_err, rad2deg(r_err));
+            end
+        else
+            % log e ritenta: jitter sulla q0
+            lastSol = qVec;
+            lastSolInfo = solInfo;
+            if verbose
+                fprintf("Pose %d not OK: solver_ok=%d outOfBounds=%d t_err=%.4fm r_err=%.3fdeg\n", ...
+                    i, okSolver, outOfBounds, t_err, rad2deg(r_err));
+            end
+            % prepara nuova initial guess: jitter intorno a qVec
+            jitter = jitterScale * randn(1, numJoints);
+            q0_vec = qVec; % partire dall'ultima soluzione
+            % clip jittered guess ai limiti
+            q0_vec = min(max(q0_vec + jitter, lowerLimits), upperLimits);
+            % converti a struct
+            q0 = vecToConfigStruct(q0_vec, robot);
+        end
+    end % while
+
+    if ~successFlag
+        warning("Pose %d: non raggiunta entro %d tentativi. Ultimi errori t=%.4fm r=%.3fdeg", ...
+            i, maxRetries, t_err, rad2deg(r_err));
+    end
+
+    % salva i risultati per la posa i
+    Q(i,:) = lastSol;
+    solInfoAll{i} = lastSolInfo;
+
+    % aggiorna q0 per la posa successiva (usa la soluzione trovata)
+    q0 = vecToConfigStruct(lastSol, robot);
+
+    % aggiungi riga diagnostica
+    diagRows = [diagRows; i, successFlag, t_err, rad2deg(r_err), attempts];
+end
+
+% stampa e salva
 disp("Matrice delle configurazioni:");
 disp(Q);
-
-% Mostra la dimensione della matrice.
 disp(size(Q));
 
-% Salva le configurazioni e i dati associati in un file MATLAB.
-save("configurazioni_PiPER.mat", ...
-    "Q", "P", "EUL", "Ttarget", "solInfoAll");
+save("configurazioni_PiPER_debug.mat", "Q", "P", "EUL", "Ttarget", "solInfoAll", "diagRows");
 
-% Esporta la sola matrice dei giunti in formato CSV.
-writematrix(Q, "configurazioni_PiPER.csv");
+% salva CSV diagnostico
+hdr = "poseIndex,successFlag,translationError_m,rotationError_deg,attempts";
+fid = fopen(logCSVname,'w');
+fprintf(fid, "%s\n", hdr);
+fclose(fid);
+dlmt = dlmwrite(logCSVname, diagRows, '-append'); %#ok<DLMWR>
 
-% Verifica la cartella di lavoro corrente.
+disp("Log salvati:");
 disp(pwd);
+disp(logCSVname);
 
-% Fine script.
+%% Funzioni di supporto
+
+function [lower, upper] = getJointLimits(robot)
+    lower = [];
+    upper = [];
+    for b = 1:numel(robot.Bodies)
+        j = robot.Bodies{b}.Joint;
+        if ~strcmp(j.Type, "fixed")
+            lim = j.PositionLimits; % [low high]
+            lower(end+1) = lim(1);
+            upper(end+1) = lim(2);
+        end
+    end
+    % ensure row vectors
+    lower = reshape(lower,1,[]);
+    upper = reshape(upper,1,[]);
+end
+
+function cfg = vecToConfigStruct(qVec, robot)
+    % converte un vettore qVec in struct array compatibile con homeConfiguration
+    base = homeConfiguration(robot);
+    for k = 1:numel(base)
+        base(k).JointPosition = qVec(k);
+    end
+    cfg = base;
+end
+
+function [t_err, r_err] = poseError(Tact, Ttarget)
+    % ritorna translation error (m) e rotation error (rad)
+    p_act = Tact(1:3,4);
+    p_tgt = Ttarget(1:3,4);
+    t_err = norm(p_act - p_tgt);
+
+    Ract = Tact(1:3,1:3);
+    Rtgt = Ttarget(1:3,1:3);
+    Rdiff = Ract * Rtgt';
+    % numerically stable trace->angle
+    c = (trace(Rdiff) - 1) / 2;
+    c = max(-1, min(1, c));
+    r_err = acos(c);
+end
