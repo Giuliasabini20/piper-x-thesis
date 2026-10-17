@@ -235,16 +235,85 @@ disp(size(Q));
 
 save("configurazioni_PiPER_debug.mat", "Q", "P", "EUL", "Ttarget", "solInfoAll", "diagRows");
 
-% salva CSV diagnostico
-hdr = "poseIndex,successFlag,translationError_m,rotationError_deg,attempts";
-fid = fopen(logCSVname,'w');
-fprintf(fid, "%s\n", hdr);
+% Salva CSV delle configurazioni con header (nomi giunti)
+% Estrae i nomi dei giunti (ordine come in getJointLimits)
+jointNames = {};
+for b = 1:numel(robot.Bodies)
+    j = robot.Bodies{b}.Joint;
+    if ~strcmp(j.Type, "fixed")
+        jointNames{end+1} = j.Name; %#ok<SAGROW>
+    end
+end
+cfgCsv = "configurazioni_PiPER_with_header.csv";
+fid = fopen(cfgCsv,'w');
+fprintf(fid, "%s\n", strjoin(jointNames, ','));
 fclose(fid);
-dlmt = dlmwrite(logCSVname, diagRows, '-append'); %#ok<DLMWR>
+% Scrive la matrice Q sotto l'header
+try
+    writematrix(Q, cfgCsv, 'Delimiter', ',', 'WriteMode', 'append');
+catch
+    % Per versioni MATLAB più vecchie, usare dlmwrite
+    dlmwrite(cfgCsv, Q, '-append');
+end
+
+% salva CSV diagnostico esteso
+% colonne: poseIndex, successFlag, translationError_m, rotationError_deg, attempts, PoseErrorNorm, ExitFlag
+diagExtended = NaN(size(diagRows,1), 7);
+for ii = 1:size(diagRows,1)
+    poseIdx = diagRows(ii,1);
+    succ = diagRows(ii,2);
+    t_err = diagRows(ii,3);
+    r_err_deg = diagRows(ii,4);
+    attempts = diagRows(ii,5);
+    s = solInfoAll{ii};
+    if isstruct(s) && isfield(s, 'PoseErrorNorm')
+        pnorm = s.PoseErrorNorm;
+    else
+        pnorm = NaN;
+    end
+    if isstruct(s) && isfield(s, 'ExitFlag')
+        exitf = s.ExitFlag;
+    else
+        exitf = NaN;
+    end
+    diagExtended(ii,:) = [poseIdx, succ, t_err, r_err_deg, attempts, pnorm, exitf];
+end
+
+diagCsvExt = "diagnostic_pose_log_ext.csv";
+hdrExt = "poseIndex,successFlag,translationError_m,rotationError_deg,attempts,PoseErrorNorm,ExitFlag";
+fid = fopen(diagCsvExt,'w');
+fprintf(fid, "%s\n", hdrExt);
+fclose(fid);
+try
+    writematrix(diagExtended, diagCsvExt, 'Delimiter', ',', 'WriteMode', 'append');
+catch
+    dlmwrite(diagCsvExt, diagExtended, '-append');
+end
+
+% Prova a salvare solInfoAll in formato JSON per debug (opzionale)
+try
+    jsonText = jsonencode(solInfoAll);
+    fid = fopen('solInfoAll.json','w');
+    fprintf(fid, '%s', jsonText);
+    fclose(fid);
+catch ME
+    warning('Impossibile salvare solInfoAll come JSON: %s', ME.message);
+end
+
+% mantiene compatibilità con la variabile di log precedente
+fid = fopen(logCSVname,'w');
+fprintf(fid, "%s\n", "poseIndex,successFlag,translationError_m,rotationError_deg,attempts");
+fclose(fid);
+try
+    dlmwrite(logCSVname, diagRows, '-append');
+catch
+    % ignore
+end
 
 disp("Log salvati:");
 disp(pwd);
-disp(logCSVname);
+disp(cfgCsv);
+disp(diagCsvExt);
 
 %% Funzioni di supporto
 
