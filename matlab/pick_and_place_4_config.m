@@ -38,7 +38,7 @@ title("Robot nella configurazione iniziale");
 % Nome reale dell'end-effector (sostituisci con il nome reale)
 ee = "NOME_REALE_DEL_FRAME_DELLA_PINZA";
 
-% Punti target (m) e orientazioni (eul ZYX)
+% Punti target (m) e orientazioni (eul ZYX) devo mettere le posizion i e l 'orientazione desiderate x ogni configurazione della pinza, quindi per tutte e 4 le pose intermedie
 P = [
     0.30  0.10  0.25;
     0.30  0.10  0.15;
